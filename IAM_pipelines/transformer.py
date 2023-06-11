@@ -1,35 +1,13 @@
-import sys
-import os
-
-from collections import OrderedDict, Counter
-
-import pandas as pd
 import numpy as np
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 
 import torchvision as tv
-from torchvision.io import read_image
 
 import torch.nn.functional as F
 
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
-
-from datetime import datetime
-
-from PIL import Image
-
-from tqdm import tqdm
-
-import matplotlib.pyplot as plt
-
-from sklearn.model_selection import train_test_split
-
-# device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-# device = "cpu"
+device = "cpu"
 
 # resizes to largest width in batch x 128, keeping aspect ratio and padding image
 class resizeImage(object):
@@ -64,37 +42,39 @@ class resizeImage(object):
         resized_padded = F.pad(resized, (padding_left, padding_right, padding_up, padding_down), mode = "constant", value = 255)
 
         return resized_padded
-    
+
+# paper adds gaussian noise to image (sqrt(0.1) * rand from gaussian distri)
+class addGaussianNoise(object):
+    def __call__(self, image):
+        image += ((0.1**0.5) * torch.randn(image.shape)) * 0.75
+
+        return image
+
 class SinPosEncoding(nn.Module):
     def __init__(self, dimensionality):
         super(SinPosEncoding, self).__init__()
-        self.dims = dimensionality
+        self.dimensionality = dimensionality
         self.max_len = 1000
 
-        # position vector
-        positions = torch.arange(0, self.max_len).unsqueeze(1)
-        # calculate added angle for sin/cos
-        angle = torch.exp(torch.arange(0, self.dims, 1) * (-np.log(10000.0) / self.dims))
+        # initialize encodings
+        pos_encodings = torch.zeros((self.max_len, 1, self.dimensionality), dtype = torch.float32)
 
-        # initialize the 2D positional encodings array
-        pos_encodings = torch.zeros(self.max_len, 1, self.dims)
-        # calucalte encodings
-        pos_encodings[:, 0, :] = torch.sin(positions * angle)
-
-        # add to buffer for training performance (?)
+        # loop through size of matrix
+        for j in range(self.max_len):
+            for i in np.arange(int(self.dimensionality / 2)):
+                # calc sin and cos wave offsets (alternated) for each row of matrix
+                pos_encodings[j, 0, 2*i] = np.sin(j / (self.max_len ** ((2*i) / self.dimensionality)))
+                pos_encodings[j, 0, 2*i + 1] = np.cos(j / (self.max_len ** ((2*i) / self.dimensionality)))
+              
+        # add to buffer for performance (?)
         self.register_buffer('pos_encodings', pos_encodings)
 
-    
     def forward(self, input: torch.Tensor):
-        # print("\n", input.shape)
-        # print(self.pos_encodings.shape)
-        # print(self.pos_encodings[0:input.size(0)].shape)
         # adds the positional encoding elementwise to the tensor (seqlength, batch, embeddims)
         input += self.pos_encodings[0:input.size(0)]
-        # print("succes\n")
 
         return input
-    
+
 class CNN(nn.Module):
     def __init__(self, input_height, input_width):
         super(CNN, self).__init__()
@@ -168,16 +148,16 @@ class CNN(nn.Module):
         conv_out = self.layerNorm6(self.leakyRelu(self.flattenConv(conv_out)))
 
         # reshape from ((batch, 128, 1, x) -> (batch, x, 1, 128)) for dense layer
-        conv_out = torch.reshape(conv_out, (conv_out.size(0), conv_out.size(3), conv_out.size(2), conv_out.size(1)))
+        conv_out = torch.permute(conv_out, (0, 3, 2, 1))
 
         # upscale from 128 to 256
         conv_out = self.dense(conv_out)
 
         # reshape to (seq, batch, embed_dim)
-        conv_out = torch.reshape(conv_out, (conv_out.size(1), conv_out.size(0), conv_out.size(3)))
+        conv_out = torch.permute(conv_out.squeeze(2), (1, 0, 2))
         
         return conv_out
-    
+
 class HWRTransformerEncoder(nn.Module):
     def __init__(self, total_nr_of_tokens):
         super(HWRTransformerEncoder, self).__init__()
@@ -197,18 +177,20 @@ class HWRTransformerEncoder(nn.Module):
         encoder_out = self.trans_encoder3(encoder_out)
         encoder_out = self.trans_encoder4(encoder_out)
 
-        return encoder_out
-    
+        return encoder_out 
+
 class HWRTransformerDecoder(nn.Module):
     def __init__(self, total_nr_of_tokens):
         super(HWRTransformerDecoder, self).__init__()
 
+        # batch first = false -> input should be [target_len, batch_size, nr_tokens]
         # transformer decoder layers (4 stacked transformer encoder layers (4 headed attention))
         self.trans_decoder1 = nn.TransformerDecoderLayer(d_model = 256, nhead = 4, dim_feedforward = 1024, dropout = 0.2)
         self.trans_decoder2 = nn.TransformerDecoderLayer(d_model = 256, nhead = 4, dim_feedforward = 1024, dropout = 0.2)
         self.trans_decoder3 = nn.TransformerDecoderLayer(d_model = 256, nhead = 4, dim_feedforward = 1024, dropout = 0.2)
         self.trans_decoder4 = nn.TransformerDecoderLayer(d_model = 256, nhead = 4, dim_feedforward = 1024, dropout = 0.2)
 
+        # reshape output to number of possible tokens
         self.decoder_out_dense = nn.Linear(256, total_nr_of_tokens)
 
     def forward(self, decoder_in, encoder_out, target_mask):
@@ -230,7 +212,7 @@ class HWRTransformer(nn.Module):
         self.cnn = CNN(input_height, input_width)
 
         # pre-encoder positional information
-        self.encoder_pos_encoding = SinPosEncoding(dimensionality = 256)
+        self.pos_encoding = SinPosEncoding(dimensionality = 256)
 
         # Transformer encoder
         self.transformer_encoder = HWRTransformerEncoder(total_nr_of_tokens)
@@ -256,34 +238,70 @@ class HWRTransformer(nn.Module):
             for j in range(size):
                 if (j > i):
                     mask[i][j] = float('-inf')
+        # print(mask)
         return mask
-    
+
     def forward(self, input_image, decoder_in_embed_idxs):
         # forward through backbone convolutional neural network
         cnn_out = self.cnn(input_image)
 
         # add pre-encoder positional information
-        cnn_out = self.encoder_pos_encoding(cnn_out)
+        cnn_out = self.pos_encoding(cnn_out)
         
         # forward through transformer encoder
         encoder_out = self.transformer_encoder(cnn_out)
 
-        # dense layer for intermediate output (to backprop with CTC Loss)
+        # print("Encoder out shape:", encoder_out.shape)
+
+        # dense layer for intermediate output (to backprop with CTC Loss).
         # clone, otherwise inplace operation error (compute graph messes up)
         cloned_encoder_out = torch.clone(encoder_out)
         interm_encoder_out = self.encoder_out_logsoftmax(self.encoder_out_dense(cloned_encoder_out))
 
         # add pre-decoder positional information
-        encoder_out = self.encoder_pos_encoding(encoder_out)
+        encoder_out = self.pos_encoding(encoder_out)
 
         # embed character indices for input into decoder
         shifted_target = self.char_embedding(decoder_in_embed_idxs)
-        # reshape from (batch, seq_len, 1, embed_dim) -> (seq_len, batch, embed_dim)
-        shifted_target = torch.reshape(shifted_target, (shifted_target.size(1), shifted_target.size(0), shifted_target.size(3)))
+
+        # reshape from (batch, seq_len, embed_dim) -> (seq_len, batch, embed_dim)
+        shifted_target = torch.permute(shifted_target, (1, 0, 2))
+
+        # add positional encoding to shifted targets
+        shifted_target = self.pos_encoding(shifted_target)
 
         # forward through transformer decoder
         decoder_out = self.transformer_decoder(shifted_target, encoder_out, self.decoder_target_mask)
-        # reshape from (seq_len, batch, nr_classes) to (batch, seq_len, nr_classes)
-        decoder_out = torch.reshape(decoder_out, (decoder_out.size(1), decoder_out.size(0), decoder_out.size(2)))
 
         return interm_encoder_out, decoder_out
+
+class HybridLoss(nn.Module):
+    def __init__(self, balance, nr_of_classes):
+        super(HybridLoss, self).__init__()
+        # allignment probabilities over encoded input sequence and target sequence
+        #   labels are in conform with char to idx mapping (nr of classes - 1 indices)
+        #   so I decided to make the blank index the next unused idx mapping
+        self.interm_CTCloss = nn.CTCLoss()
+        # difference between decodeced input sequence and target sequence
+        self.output_CELoss = nn.CrossEntropyLoss()
+
+        # balance between CTC Loss and CE Loss (R: [0, 1])
+        if balance < 0 or balance > 1:
+            raise ValueError("Balance should be a value between 0 (only output CELoss) and 1 (only intermediate CTCLoss)")
+        self.balance = balance
+
+    def setBalance(self, balance):
+        self.balance = balance
+
+    def forward(self, encoder_outputs, encoder_targets, label_lengths, decoder_outputs, decoder_targets):
+        # create input lengths tensor based on the size of the encoder output 
+        input_lengths = torch.tensor([encoder_outputs.size(0)]).repeat(encoder_outputs.size(1))
+
+        # cross entropy needs (batch_size, seq_len, nr_tokens), right now its (seq_len, batch_size, nr_tokens)
+        decoder_outputs = torch.permute(decoder_outputs, (1, 0, 2))
+        decoder_targets = torch.permute(decoder_targets, (1, 0, 2))
+
+        interm_loss = self.interm_CTCloss(encoder_outputs, encoder_targets, input_lengths, label_lengths)
+        output_loss = self.output_CELoss(decoder_outputs, decoder_targets)
+
+        return (self.balance * interm_loss + (1 - self.balance) * output_loss)

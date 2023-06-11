@@ -1,0 +1,4 @@
+run as:
+python3 predict.py "path/to/image/dir"
+
+Model still needs training :(
